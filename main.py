@@ -35,6 +35,33 @@ def vtt_to_text(vtt_path: str) -> str:
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+    
+@app.get("/debug")
+def debug(videoId: str = Query(..., alias="videoId")):
+    # 1) write cookies file
+    cookies_txt = os.environ.get("YOUTUBE_COOKIES", "")
+    with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
+        cf.write(cookies_txt)
+
+    cookie_bytes = len(cookies_txt.encode("utf-8"))
+
+    # 2) run yt-dlp probe WITH cookies
+    url = f"https://www.youtube.com/watch?v={videoId}"
+    probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", "-J", url]
+    try:
+        res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ok = True
+        stderr = ""
+    except subprocess.CalledProcessError as e:
+        ok = False
+        # return a short slice of stderr for inspection
+        stderr = (e.stderr or "")[-800:]
+
+    return JSONResponse({
+        "cookie_bytes": cookie_bytes,
+        "probe_ok": ok,
+        "stderr_tail": stderr,
+    })
 
 @app.get("/subs")
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
