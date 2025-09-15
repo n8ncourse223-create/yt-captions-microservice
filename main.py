@@ -7,6 +7,7 @@ import os
 import glob
 import re
 import json
+import base64
 
 app = FastAPI(title="YouTube Auto-Captions → Text API")
 
@@ -22,30 +23,42 @@ def vtt_to_text(vtt_path: str) -> str:
                 continue
             if s.startswith("WEBVTT"):
                 continue
-            # skip cue number lines like '12'
-            if s.isdigit():
+            if s.isdigit():  # cue number
                 continue
-            # skip timestamp lines
-            if TIMESTAMP_RE.search(s) or "-->" in s:
+            if TIMESTAMP_RE.search(s) or "-->" in s:  # timestamp line
                 continue
-            # drop styling tags
-            s = VTT_TAG_RE.sub("", s)
+            s = VTT_TAG_RE.sub("", s)  # drop styling tags
             lines.append(s)
-    # merge consecutive lines, collapse duplicates
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
     return text
-    
+
+def write_cookies_file() -> int:
+    """Write cookies from env to /app/cookies.txt. Prefer base64 to avoid formatting issues.
+       Returns number of bytes written."""
+    cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+    cookies_raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
+
+    cookie_text = ""
+    if cookies_b64:
+        try:
+            cookie_text = base64.b64decode(cookies_b64).decode("utf-8", "ignore")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to decode YOUTUBE_COOKIES_B64: {e}")
+    elif cookies_raw:
+        cookie_text = cookies_raw
+
+    if not cookie_text:
+        raise HTTPException(status_code=500, detail="No cookies provided. Set YOUTUBE_COOKIES_B64 (preferred) or YOUTUBE_COOKIES.")
+
+    with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
+        cf.write(cookie_text)
+    return len(cookie_text.encode("utf-8"))
+
 @app.get("/debug")
 def debug(videoId: str = Query(..., alias="videoId")):
-    # 1) write cookies file
-    cookies_txt = os.environ.get("YOUTUBE_COOKIES", "")
-    with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
-        cf.write(cookies_txt)
-
-    cookie_bytes = len(cookies_txt.encode("utf-8"))
-
-    # 2) run yt-dlp probe WITH cookies
+    # Write cookies and probe with cookies
+    cookie_bytes = write_cookies_file()
     url = f"https://www.youtube.com/watch?v={videoId}"
     probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", "-J", url]
     try:
@@ -54,8 +67,7 @@ def debug(videoId: str = Query(..., alias="videoId")):
         stderr = ""
     except subprocess.CalledProcessError as e:
         ok = False
-        # return a short slice of stderr for inspection
-        stderr = (e.stderr or "")[-800:]
+        stderr = (e.stderr or "")[-800:]  # tail for readability
 
     return JSONResponse({
         "cookie_bytes": cookie_bytes,
@@ -67,87 +79,46 @@ def debug(videoId: str = Query(..., alias="videoId")):
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
     """
     Fetch subtitles for a YouTube video and return as plain text.
-    Strategy:
-      1) Probe available caption languages via yt-dlp -J
-      2) Prefer auto-captions in requested `lang`; else try dialect match (e.g., pl-PL)
-      3) Else fall back to any available auto-caption language
-      4) If no auto-captions, try manual subtitles
-      5) Use YouTube cookies (if provided) to avoid 429
+    Uses cookies for both probe (-J) and download to avoid 429.
+    Tries requested lang, then dialect match, then any available auto; falls back to manual if no auto.
     """
-# Prefer Base64 env to avoid formatting issues; fall back to raw
-cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
-cookies_raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
-
-cookie_text = ""
-if cookies_b64:
-    import base64
-    try:
-        cookie_text = base64.b64decode(cookies_b64).decode("utf-8", "ignore")
-    except Exception:
-        pass
-if not cookie_text and cookies_raw:
-    cookie_text = cookies_raw  # raw paste fallback
-
-if not cookie_text:
-    raise HTTPException(status_code=500, detail="No cookies provided. Set YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES.")
-
-with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
-    cf.write(cookie_text)
+    cookie_bytes = write_cookies_file()
 
     with tempfile.TemporaryDirectory() as tmp:
         url = f"https://www.youtube.com/watch?v={videoId}"
 
-        # --- Probe metadata for available captions ---
-        probe_cmd = ["yt-dlp", "-J", url]
+        # --- Probe with cookies ---
+        probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", "-J", url]
         try:
             res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             info = json.loads(res.stdout)
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to probe video: {e.stderr}")
+            raise HTTPException(status_code=500, detail=f"Failed to probe video (likely 429/consent): {e.stderr[-500:]}")
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=500, detail=f"Failed to parse probe JSON: {e}")
 
         auto_caps = list((info.get("automatic_captions") or {}).keys())
         manual_subs = list((info.get("subtitles") or {}).keys())
 
-        # Helper: find first code in `langs` that matches prefix like 'pl' or 'en'
         def find_prefix(langs, prefix):
             for code in langs:
-                if code.lower().startswith(prefix.lower()):
+                if code and code.lower().startswith(prefix.lower()):
                     return code
             return None
 
         chosen_lang = None
         used_type = None  # 'auto' or 'manual'
 
-        # Prefer auto-captions in requested lang or dialect
         if auto_caps:
-            if lang in auto_caps:
-                chosen_lang = lang
-            else:
-                # try dialect match (e.g., 'pl' matches 'pl-PL')
-                pref = find_prefix(auto_caps, lang)
-                if pref:
-                    chosen_lang = pref
-            if not chosen_lang:
-                # fall back to any available auto-caption language
-                chosen_lang = auto_caps[0]
-            used_type = 'auto'
+            chosen_lang = lang if lang in auto_caps else (find_prefix(auto_caps, lang) or auto_caps[0])
+            used_type = "auto"
         elif manual_subs:
-            # no auto-captions; try manual subs
-            if lang in manual_subs:
-                chosen_lang = lang
-            else:
-                pref = find_prefix(manual_subs, lang)
-                if pref:
-                    chosen_lang = pref
-            if not chosen_lang:
-                chosen_lang = manual_subs[0]
-            used_type = 'manual'
+            chosen_lang = lang if lang in manual_subs else (find_prefix(manual_subs, lang) or manual_subs[0])
+            used_type = "manual"
         else:
             raise HTTPException(status_code=404, detail="No subtitles (auto or manual) advertised for this video.")
 
-        # --- Download captions with yt-dlp ---
+        # --- Download with cookies ---
         base_cmd = [
             "yt-dlp",
             "--cookies", "/app/cookies.txt",
@@ -157,17 +128,13 @@ with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
             "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
             url,
         ]
-        if used_type == 'auto':
-            base_cmd.insert(1, "--write-auto-subs")
-        else:
-            base_cmd.insert(1, "--write-subs")
+        base_cmd.insert(1, "--write-auto-subs" if used_type == "auto" else "--write-subs")
 
         try:
             subprocess.run(base_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=404, detail=f"Failed to download subtitles for {videoId} in {chosen_lang}: {e.stderr}")
+            raise HTTPException(status_code=404, detail=f"Failed to download subtitles for {videoId} in {chosen_lang}: {e.stderr[-500:]}")
 
-        # --- Find and parse the VTT file ---
         vtts = glob.glob(os.path.join(tmp, f"{videoId}.*.vtt")) or glob.glob(os.path.join(tmp, "*.vtt"))
         if not vtts:
             raise HTTPException(status_code=404, detail="Subtitles not found after download.")
@@ -182,6 +149,7 @@ with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
             "used_type": used_type,
             "available_auto": auto_caps,
             "available_manual": manual_subs,
+            "cookie_bytes": cookie_bytes,
             "chars": len(text),
             "text": text,
         })
