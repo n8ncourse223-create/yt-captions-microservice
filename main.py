@@ -74,9 +74,25 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
       4) If no auto-captions, try manual subtitles
       5) Use YouTube cookies (if provided) to avoid 429
     """
-    # Write cookies (if provided via env) so yt-dlp can authenticate
-    with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
-        cf.write(os.environ.get("YOUTUBE_COOKIES", ""))
+# Prefer Base64 env to avoid formatting issues; fall back to raw
+cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+cookies_raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
+
+cookie_text = ""
+if cookies_b64:
+    import base64
+    try:
+        cookie_text = base64.b64decode(cookies_b64).decode("utf-8", "ignore")
+    except Exception:
+        pass
+if not cookie_text and cookies_raw:
+    cookie_text = cookies_raw  # raw paste fallback
+
+if not cookie_text:
+    raise HTTPException(status_code=500, detail="No cookies provided. Set YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES.")
+
+with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
+    cf.write(cookie_text)
 
     with tempfile.TemporaryDirectory() as tmp:
         url = f"https://www.youtube.com/watch?v={videoId}"
