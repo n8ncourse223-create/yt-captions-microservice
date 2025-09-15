@@ -36,22 +36,40 @@ def vtt_to_text(vtt_path: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 @app.get("/subs")
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
     """
     Fetch auto-generated subtitles for a YouTube video and return as plain text.
-    Query params:
-      - videoId: YouTube video ID
-      - lang: subtitle language code (e.g., 'pl', 'en')
+    Will try the requested `lang` first, then fall back to any available language.
     """
     with tempfile.TemporaryDirectory() as tmp:
         url = f"https://www.youtube.com/watch?v={videoId}"
-        # Use yt-dlp to download auto-subs only
+
+        # Step 1: probe available subtitles
+        probe_cmd = ["yt-dlp", "-J", url]
+        try:
+            result = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            info = result.stdout
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to probe video: {e.stderr}")
+
+        # Look for available subtitle languages
+        available_langs = []
+        for line in info.splitlines():
+            if '"language":' in line:
+                lang_code = line.strip().split(":")[-1].strip().strip('"').strip(",")
+                available_langs.append(lang_code)
+
+        # Step 2: pick a language to use
+        chosen_lang = lang
+        if lang not in available_langs and available_langs:
+            chosen_lang = available_langs[0]  # fallback to first available
+
+        # Step 3: try to download subtitles
         cmd = [
             "yt-dlp",
             "--write-auto-subs",
-            f"--sub-lang={lang}",
+            f"--sub-lang={chosen_lang}",
             "--skip-download",
             "--sub-format", "vtt",
             "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
@@ -59,30 +77,24 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
         ]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        except subprocess.CalledProcessError as e:
-            # Try fallback language if primary failed
-            alt = "en" if lang != "en" else "pl"
-            try:
-                cmd[2] = f"--sub-lang={alt}"
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                lang = alt
-            except subprocess.CalledProcessError:
-                raise HTTPException(status_code=404, detail=f"No subtitles found for video {videoId} in {lang} or fallback.")
+        except subprocess.CalledProcessError:
+            raise HTTPException(status_code=404, detail=f"No subtitles found for video {videoId} in {chosen_lang}.")
 
-        # find the downloaded .vtt file
-        vtts = glob.glob(os.path.join(tmp, f"{videoId}.*.vtt")) or glob.glob(os.path.join(tmp, f"*.vtt"))
+        # Step 4: find the .vtt file and parse it
+        vtts = glob.glob(os.path.join(tmp, f"{videoId}.*.vtt")) or glob.glob(os.path.join(tmp, "*.vtt"))
         if not vtts:
             raise HTTPException(status_code=404, detail="Subtitles not found after download.")
         text = vtt_to_text(vtts[0])
         if not text:
             raise HTTPException(status_code=422, detail="Subtitles parsed but empty.")
+
         return JSONResponse({
             "video_id": videoId,
-            "lang": lang,
+            "requested_lang": lang,
+            "used_lang": chosen_lang,
             "chars": len(text),
             "text": text,
         })
-
 # requirements.txt
 # fastapi
 # uvicorn
