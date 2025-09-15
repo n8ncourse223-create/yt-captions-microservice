@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 import tempfile
@@ -5,12 +6,12 @@ import subprocess
 import os
 import glob
 import re
+import json
 
 app = FastAPI(title="YouTube Auto-Captions → Text API")
 
 VTT_TAG_RE = re.compile(r"<[^>]+>")
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
-
 
 def vtt_to_text(vtt_path: str) -> str:
     lines = []
@@ -32,58 +33,98 @@ def vtt_to_text(vtt_path: str) -> str:
             lines.append(s)
     # merge consecutive lines, collapse duplicates
     text = " ".join(lines)
-    # collapse repeated spaces
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 @app.get("/subs")
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
-    with open("/app/cookies.txt", "w", encoding="utf-8") as f:
-    f.write(os.environ.get("YOUTUBE_COOKIES", ""))
     """
-    Fetch auto-generated subtitles for a YouTube video and return as plain text.
-    Will try the requested `lang` first, then fall back to any available language.
+    Fetch subtitles for a YouTube video and return as plain text.
+    Strategy:
+      1) Probe available caption languages via yt-dlp -J
+      2) Prefer auto-captions in requested `lang`; else try dialect match (e.g., pl-PL)
+      3) Else fall back to any available auto-caption language
+      4) If no auto-captions, try manual subtitles
+      5) Use YouTube cookies (if provided) to avoid 429
     """
+    # Write cookies (if provided via env) so yt-dlp can authenticate
+    with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
+        cf.write(os.environ.get("YOUTUBE_COOKIES", ""))
+
     with tempfile.TemporaryDirectory() as tmp:
         url = f"https://www.youtube.com/watch?v={videoId}"
 
-        # Step 1: probe available subtitles
+        # --- Probe metadata for available captions ---
         probe_cmd = ["yt-dlp", "-J", url]
         try:
-            result = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            info = result.stdout
+            res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            info = json.loads(res.stdout)
         except subprocess.CalledProcessError as e:
             raise HTTPException(status_code=500, detail=f"Failed to probe video: {e.stderr}")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse probe JSON: {e}")
 
-        # Look for available subtitle languages
-        available_langs = []
-        for line in info.splitlines():
-            if '"language":' in line:
-                lang_code = line.strip().split(":")[-1].strip().strip('"').strip(",")
-                available_langs.append(lang_code)
+        auto_caps = list((info.get("automatic_captions") or {}).keys())
+        manual_subs = list((info.get("subtitles") or {}).keys())
 
-        # Step 2: pick a language to use
-        chosen_lang = lang
-        if lang not in available_langs and available_langs:
-            chosen_lang = available_langs[0]  # fallback to first available
+        # Helper: find first code in `langs` that matches prefix like 'pl' or 'en'
+        def find_prefix(langs, prefix):
+            for code in langs:
+                if code.lower().startswith(prefix.lower()):
+                    return code
+            return None
 
-        # Step 3: try to download subtitles
-        cmd = [
-    "yt-dlp",
-    "--cookies", "/app/cookies.txt",
-    "--write-auto-subs",
-    f"--sub-lang={chosen_lang}",
-    "--skip-download",
-    "--sub-format", "vtt",
-    "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
-    url,
-]
+        chosen_lang = None
+        used_type = None  # 'auto' or 'manual'
+
+        # Prefer auto-captions in requested lang or dialect
+        if auto_caps:
+            if lang in auto_caps:
+                chosen_lang = lang
+            else:
+                # try dialect match (e.g., 'pl' matches 'pl-PL')
+                pref = find_prefix(auto_caps, lang)
+                if pref:
+                    chosen_lang = pref
+            if not chosen_lang:
+                # fall back to any available auto-caption language
+                chosen_lang = auto_caps[0]
+            used_type = 'auto'
+        elif manual_subs:
+            # no auto-captions; try manual subs
+            if lang in manual_subs:
+                chosen_lang = lang
+            else:
+                pref = find_prefix(manual_subs, lang)
+                if pref:
+                    chosen_lang = pref
+            if not chosen_lang:
+                chosen_lang = manual_subs[0]
+            used_type = 'manual'
+        else:
+            raise HTTPException(status_code=404, detail="No subtitles (auto or manual) advertised for this video.")
+
+        # --- Download captions with yt-dlp ---
+        base_cmd = [
+            "yt-dlp",
+            "--cookies", "/app/cookies.txt",
+            f"--sub-lang={chosen_lang}",
+            "--skip-download",
+            "--sub-format", "vtt",
+            "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
+            url,
+        ]
+        if used_type == 'auto':
+            base_cmd.insert(1, "--write-auto-subs")
+        else:
+            base_cmd.insert(1, "--write-subs")
+
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        except subprocess.CalledProcessError:
-            raise HTTPException(status_code=404, detail=f"No subtitles found for video {videoId} in {chosen_lang}.")
+            subprocess.run(base_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(status_code=404, detail=f"Failed to download subtitles for {videoId} in {chosen_lang}: {e.stderr}")
 
-        # Step 4: find the .vtt file and parse it
+        # --- Find and parse the VTT file ---
         vtts = glob.glob(os.path.join(tmp, f"{videoId}.*.vtt")) or glob.glob(os.path.join(tmp, "*.vtt"))
         if not vtts:
             raise HTTPException(status_code=404, detail="Subtitles not found after download.")
@@ -95,10 +136,9 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             "video_id": videoId,
             "requested_lang": lang,
             "used_lang": chosen_lang,
+            "used_type": used_type,
+            "available_auto": auto_caps,
+            "available_manual": manual_subs,
             "chars": len(text),
             "text": text,
         })
-# requirements.txt
-# fastapi
-# uvicorn
-# yt-dlp
