@@ -38,6 +38,8 @@ def vtt_to_text(vtt_path: str) -> str:
 
 @app.get("/subs")
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
+    with open("/app/cookies.txt", "w", encoding="utf-8") as f:
+    f.write(os.environ.get("YOUTUBE_COOKIES", ""))
     """
     Fetch auto-generated subtitles for a YouTube video and return as plain text.
     Will try the requested `lang` first, then fall back to any available language.
@@ -67,14 +69,15 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
 
         # Step 3: try to download subtitles
         cmd = [
-            "yt-dlp",
-            "--write-auto-subs",
-            f"--sub-lang={chosen_lang}",
-            "--skip-download",
-            "--sub-format", "vtt",
-            "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
-            url,
-        ]
+    "yt-dlp",
+    "--cookies", "/app/cookies.txt",
+    "--write-auto-subs",
+    f"--sub-lang={chosen_lang}",
+    "--skip-download",
+    "--sub-format", "vtt",
+    "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
+    url,
+]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError:
