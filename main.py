@@ -18,7 +18,16 @@ def vtt_to_text(vtt_path: str) -> str:
     VTT_TAG_RE = re.compile(r"<[^>]+>")
     TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
     DROP_PREFIXES = ("WEBVTT", "Kind:", "Language:")
-    NOISE_BRACKETS = re.compile(r"^\[[^\]]+\]$")  # [Muzyka], [Music], etc.
+    NOISE_BRACKETS = re.compile(r"^\[[^\]]+\]$")  # e.g., [Muzyka]
+
+    def too_similar(a: str, b: str) -> bool:
+        a_words = [w for w in re.findall(r"\w+", a.lower()) if len(w) > 1]
+        b_words = [w for w in re.findall(r"\w+", b.lower()) if len(w) > 1]
+        if not a_words or not b_words:
+            return False
+        aset, bset = set(a_words), set(b_words)
+        overlap = len(aset & bset) / min(len(aset), len(bset))
+        return overlap >= 0.8  # only drop near-duplicates
 
     lines = []
     prev = ""
@@ -39,8 +48,8 @@ def vtt_to_text(vtt_path: str) -> str:
 
             s = VTT_TAG_RE.sub("", s)
 
-            # Skip exact dupes and obvious overlaps with previous cue
-            if s == prev or s.endswith(prev) or prev.endswith(s):
+            # Skip only if nearly the same as previous cue
+            if prev and too_similar(s, prev):
                 continue
 
             lines.append(s)
@@ -49,18 +58,8 @@ def vtt_to_text(vtt_path: str) -> str:
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Collapse immediate word repeats: "państwa. państwa." -> "państwa."
+    # Light pass to collapse immediate word repeats (keeps meaning)
     text = re.sub(r"\b(\w{2,})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
-
-    # Collapse small phrase repeats (up to 4 words) that occur back-to-back
-    # e.g., "Nowa seria, proszę państwa. Nowa seria, proszę państwa."
-    for _ in range(3):
-        text = re.sub(
-            r"(\b[\wĄąĆćĘęŁłŃńÓóŚśŹźŻż\-]+(?:\s+[\wĄąĆćĘęŁłŃńÓóŚśŹźŻż\-]+){0,3}[.,!?:]?)\s+\1\b",
-            r"\1",
-            text,
-            flags=re.IGNORECASE
-        )
 
     return text
 
