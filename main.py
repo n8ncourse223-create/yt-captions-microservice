@@ -15,22 +15,53 @@ VTT_TAG_RE = re.compile(r"<[^>]+>")
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
 
 def vtt_to_text(vtt_path: str) -> str:
+    VTT_TAG_RE = re.compile(r"<[^>]+>")
+    TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
+    DROP_PREFIXES = ("WEBVTT", "Kind:", "Language:")
+    NOISE_BRACKETS = re.compile(r"^\[[^\]]+\]$")  # [Muzyka], [Music], etc.
+
     lines = []
+    prev = ""
+
     with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
             s = raw.strip()
             if not s:
                 continue
-            if s.startswith("WEBVTT"):
+            if s.startswith(DROP_PREFIXES):
                 continue
-            if s.isdigit():  # cue number
+            if s.isdigit():
                 continue
-            if TIMESTAMP_RE.search(s) or "-->" in s:  # timestamp line
+            if TIMESTAMP_RE.search(s) or "-->" in s:
                 continue
-            s = VTT_TAG_RE.sub("", s)  # drop styling tags
+            if NOISE_BRACKETS.match(s):
+                continue
+
+            s = VTT_TAG_RE.sub("", s)
+
+            # Skip exact dupes and obvious overlaps with previous cue
+            if s == prev or s.endswith(prev) or prev.endswith(s):
+                continue
+
             lines.append(s)
+            prev = s
+
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
+
+    # Collapse immediate word repeats: "państwa. państwa." -> "państwa."
+    text = re.sub(r"\b(\w{2,})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
+
+    # Collapse small phrase repeats (up to 4 words) that occur back-to-back
+    # e.g., "Nowa seria, proszę państwa. Nowa seria, proszę państwa."
+    for _ in range(3):
+        text = re.sub(
+            r"(\b[\wĄąĆćĘęŁłŃńÓóŚśŹźŻż\-]+(?:\s+[\wĄąĆćĘęŁłŃńÓóŚśŹźŻż\-]+){0,3}[.,!?:]?)\s+\1\b",
+            r"\1",
+            text,
+            flags=re.IGNORECASE
+        )
+
     return text
 
 def write_cookies_file() -> int:
