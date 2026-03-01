@@ -14,12 +14,20 @@ app = FastAPI(title="YouTube Auto-Captions → Text API")
 VTT_TAG_RE = re.compile(r"<[^>]+>")
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
 
-# Minimal change: prefer android client to avoid newer web-client Data Sync ID issues
-YTDLP_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android"]
+# OPTIONAL: If YouTube starts requiring a Data Sync ID again, set this env var in Render:
+# YOUTUBE_DATA_SYNC_ID = "XXXX"
+YOUTUBE_DATA_SYNC_ID = os.environ.get("YOUTUBE_DATA_SYNC_ID", "").strip()
+
+def ytdlp_extractor_args():
+    """
+    Prefer default web client so cookies work.
+    Only add data_sync_id if provided (optional).
+    """
+    if YOUTUBE_DATA_SYNC_ID:
+        return ["--extractor-args", f"youtube:data_sync_id={YOUTUBE_DATA_SYNC_ID}"]
+    return []
 
 def vtt_to_text(vtt_path: str) -> str:
-    VTT_TAG_RE = re.compile(r"<[^>]+>")
-    TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
     DROP_PREFIXES = ("WEBVTT", "Kind:", "Language:")
     NOISE_BRACKETS = re.compile(r"^\[[^\]]+\]$")  # e.g., [Muzyka]
 
@@ -67,8 +75,10 @@ def vtt_to_text(vtt_path: str) -> str:
     return text
 
 def write_cookies_file() -> int:
-    """Write cookies from env to /app/cookies.txt. Prefer base64 to avoid formatting issues.
-       Returns number of bytes written."""
+    """
+    Write cookies from env to /app/cookies.txt. Prefer base64 to avoid formatting issues.
+    Returns number of bytes written.
+    """
     cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
     cookies_raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
 
@@ -82,7 +92,10 @@ def write_cookies_file() -> int:
         cookie_text = cookies_raw
 
     if not cookie_text:
-        raise HTTPException(status_code=500, detail="No cookies provided. Set YOUTUBE_COOKIES_B64 (preferred) or YOUTUBE_COOKIES.")
+        raise HTTPException(
+            status_code=500,
+            detail="No cookies provided. Set YOUTUBE_COOKIES_B64 (preferred) or YOUTUBE_COOKIES."
+        )
 
     with open("/app/cookies.txt", "w", encoding="utf-8") as cf:
         cf.write(cookie_text)
@@ -90,30 +103,38 @@ def write_cookies_file() -> int:
 
 @app.get("/debug")
 def debug(videoId: str = Query(..., alias="videoId")):
-    # Write cookies and probe with cookies
     cookie_bytes = write_cookies_file()
     url = f"https://www.youtube.com/watch?v={videoId}"
-    probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", *YTDLP_EXTRACTOR_ARGS, "-J", url]
+
+    probe_cmd = [
+        "yt-dlp",
+        "--cookies", "/app/cookies.txt",
+        *ytdlp_extractor_args(),
+        "-J",
+        url,
+    ]
+
     try:
-        res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         ok = True
         stderr = ""
     except subprocess.CalledProcessError as e:
         ok = False
-        stderr = (e.stderr or "")[-800:]  # tail for readability
+        stderr = (e.stderr or "")[-1200:]  # tail for readability
 
     return JSONResponse({
         "cookie_bytes": cookie_bytes,
         "probe_ok": ok,
         "stderr_tail": stderr,
-        "probe_cmd": probe_cmd,  # helps debug without secrets
+        "probe_cmd": probe_cmd,
+        "data_sync_id_enabled": bool(YOUTUBE_DATA_SYNC_ID),
     })
 
 @app.get("/subs")
 async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl"):
     """
     Fetch subtitles for a YouTube video and return as plain text.
-    Uses cookies for both probe (-J) and download to avoid 429.
+    Uses cookies for both probe (-J) and download to avoid 429/consent.
     Tries requested lang, then dialect match, then any available auto; falls back to manual if no auto.
     """
     cookie_bytes = write_cookies_file()
@@ -122,12 +143,18 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
         url = f"https://www.youtube.com/watch?v={videoId}"
 
         # --- Probe with cookies ---
-        probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", *YTDLP_EXTRACTOR_ARGS, "-J", url]
+        probe_cmd = [
+            "yt-dlp",
+            "--cookies", "/app/cookies.txt",
+            *ytdlp_extractor_args(),
+            "-J",
+            url,
+        ]
         try:
             res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             info = json.loads(res.stdout)
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to probe video (likely 429/consent): {e.stderr[-500:]}")
+            raise HTTPException(status_code=500, detail=f"Failed to probe video (likely 429/consent): {(e.stderr or '')[-800:]}")
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=500, detail=f"Failed to parse probe JSON: {e}")
 
@@ -140,9 +167,6 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
                     return code
             return None
 
-        chosen_lang = None
-        used_type = None  # 'auto' or 'manual'
-
         if auto_caps:
             chosen_lang = lang if lang in auto_caps else (find_prefix(auto_caps, lang) or auto_caps[0])
             used_type = "auto"
@@ -153,27 +177,28 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             raise HTTPException(status_code=404, detail="No subtitles (auto or manual) advertised for this video.")
 
         # --- Download with cookies ---
-        base_cmd = [
+        write_flag = "--write-auto-subs" if used_type == "auto" else "--write-subs"
+        dl_cmd = [
             "yt-dlp",
-            *YTDLP_EXTRACTOR_ARGS,
+            write_flag,
             "--cookies", "/app/cookies.txt",
+            *ytdlp_extractor_args(),
             f"--sub-lang={chosen_lang}",
             "--skip-download",
             "--sub-format", "vtt",
             "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
             url,
         ]
-        base_cmd.insert(1, "--write-auto-subs" if used_type == "auto" else "--write-subs")
-        # Note: insert(1, ...) keeps it right after yt-dlp; extractor args remain present in list
 
         try:
-            subprocess.run(base_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(dl_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=404, detail=f"Failed to download subtitles for {videoId} in {chosen_lang}: {e.stderr[-500:]}")
+            raise HTTPException(status_code=404, detail=f"Failed to download subtitles for {videoId} in {chosen_lang}: {(e.stderr or '')[-800:]}")
 
         vtts = glob.glob(os.path.join(tmp, f"{videoId}.*.vtt")) or glob.glob(os.path.join(tmp, "*.vtt"))
         if not vtts:
             raise HTTPException(status_code=404, detail="Subtitles not found after download.")
+
         text = vtt_to_text(vtts[0])
         if not text:
             raise HTTPException(status_code=422, detail="Subtitles parsed but empty.")
@@ -188,4 +213,5 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             "cookie_bytes": cookie_bytes,
             "chars": len(text),
             "text": text,
+            "data_sync_id_enabled": bool(YOUTUBE_DATA_SYNC_ID),
         })
