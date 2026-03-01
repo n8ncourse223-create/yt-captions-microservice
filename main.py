@@ -14,18 +14,12 @@ app = FastAPI(title="YouTube Auto-Captions → Text API")
 VTT_TAG_RE = re.compile(r"<[^>]+>")
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
 
-# OPTIONAL: If YouTube starts requiring a Data Sync ID again, set this env var in Render:
-# YOUTUBE_DATA_SYNC_ID = "XXXX"
-YOUTUBE_DATA_SYNC_ID = os.environ.get("YOUTUBE_DATA_SYNC_ID", "").strip()
-
-def ytdlp_extractor_args():
-    """
-    Prefer default web client so cookies work.
-    Only add data_sync_id if provided (optional).
-    """
-    if YOUTUBE_DATA_SYNC_ID:
-        return ["--extractor-args", f"youtube:data_sync_id={YOUTUBE_DATA_SYNC_ID}"]
-    return []
+# Required for YouTube JS challenge solving (EJS).
+# Needs Deno installed in the container (we added it in Dockerfile).
+YTDLP_FLAGS = [
+    "--js-runtimes", "deno",
+    "--remote-components", "ejs:github",
+]
 
 def vtt_to_text(vtt_path: str) -> str:
     DROP_PREFIXES = ("WEBVTT", "Kind:", "Language:")
@@ -38,7 +32,7 @@ def vtt_to_text(vtt_path: str) -> str:
             return False
         aset, bset = set(a_words), set(b_words)
         overlap = len(aset & bset) / min(len(aset), len(bset))
-        return overlap >= 0.8  # only drop near-duplicates
+        return overlap >= 0.8
 
     lines = []
     prev = ""
@@ -59,7 +53,6 @@ def vtt_to_text(vtt_path: str) -> str:
 
             s = VTT_TAG_RE.sub("", s)
 
-            # Skip only if nearly the same as previous cue
             if prev and too_similar(s, prev):
                 continue
 
@@ -68,17 +61,11 @@ def vtt_to_text(vtt_path: str) -> str:
 
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
-
-    # Light pass to collapse immediate word repeats (keeps meaning)
     text = re.sub(r"\b(\w{2,})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
-
     return text
 
 def write_cookies_file() -> int:
-    """
-    Write cookies from env to /app/cookies.txt. Prefer base64 to avoid formatting issues.
-    Returns number of bytes written.
-    """
+    """Write cookies from env to /app/cookies.txt. Prefer base64 to avoid formatting issues."""
     cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
     cookies_raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
 
@@ -109,7 +96,7 @@ def debug(videoId: str = Query(..., alias="videoId")):
     probe_cmd = [
         "yt-dlp",
         "--cookies", "/app/cookies.txt",
-        *ytdlp_extractor_args(),
+        *YTDLP_FLAGS,
         "-J",
         url,
     ]
@@ -120,14 +107,13 @@ def debug(videoId: str = Query(..., alias="videoId")):
         stderr = ""
     except subprocess.CalledProcessError as e:
         ok = False
-        stderr = (e.stderr or "")[-1200:]  # tail for readability
+        stderr = (e.stderr or "")[-1200:]
 
     return JSONResponse({
         "cookie_bytes": cookie_bytes,
         "probe_ok": ok,
         "stderr_tail": stderr,
         "probe_cmd": probe_cmd,
-        "data_sync_id_enabled": bool(YOUTUBE_DATA_SYNC_ID),
     })
 
 @app.get("/subs")
@@ -146,7 +132,7 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
         probe_cmd = [
             "yt-dlp",
             "--cookies", "/app/cookies.txt",
-            *ytdlp_extractor_args(),
+            *YTDLP_FLAGS,
             "-J",
             url,
         ]
@@ -182,7 +168,7 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             "yt-dlp",
             write_flag,
             "--cookies", "/app/cookies.txt",
-            *ytdlp_extractor_args(),
+            *YTDLP_FLAGS,
             f"--sub-lang={chosen_lang}",
             "--skip-download",
             "--sub-format", "vtt",
@@ -213,5 +199,4 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             "cookie_bytes": cookie_bytes,
             "chars": len(text),
             "text": text,
-            "data_sync_id_enabled": bool(YOUTUBE_DATA_SYNC_ID),
         })
