@@ -14,6 +14,9 @@ app = FastAPI(title="YouTube Auto-Captions → Text API")
 VTT_TAG_RE = re.compile(r"<[^>]+>")
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
 
+# Minimal change: prefer android client to avoid newer web-client Data Sync ID issues
+YTDLP_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android"]
+
 def vtt_to_text(vtt_path: str) -> str:
     VTT_TAG_RE = re.compile(r"<[^>]+>")
     TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> ")
@@ -90,7 +93,7 @@ def debug(videoId: str = Query(..., alias="videoId")):
     # Write cookies and probe with cookies
     cookie_bytes = write_cookies_file()
     url = f"https://www.youtube.com/watch?v={videoId}"
-    probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", "-J", url]
+    probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", *YTDLP_EXTRACTOR_ARGS, "-J", url]
     try:
         res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         ok = True
@@ -103,6 +106,7 @@ def debug(videoId: str = Query(..., alias="videoId")):
         "cookie_bytes": cookie_bytes,
         "probe_ok": ok,
         "stderr_tail": stderr,
+        "probe_cmd": probe_cmd,  # helps debug without secrets
     })
 
 @app.get("/subs")
@@ -118,7 +122,7 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
         url = f"https://www.youtube.com/watch?v={videoId}"
 
         # --- Probe with cookies ---
-        probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", "-J", url]
+        probe_cmd = ["yt-dlp", "--cookies", "/app/cookies.txt", *YTDLP_EXTRACTOR_ARGS, "-J", url]
         try:
             res = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             info = json.loads(res.stdout)
@@ -151,6 +155,7 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
         # --- Download with cookies ---
         base_cmd = [
             "yt-dlp",
+            *YTDLP_EXTRACTOR_ARGS,
             "--cookies", "/app/cookies.txt",
             f"--sub-lang={chosen_lang}",
             "--skip-download",
@@ -159,6 +164,7 @@ async def get_subs(videoId: str = Query(..., alias="videoId"), lang: str = "pl")
             url,
         ]
         base_cmd.insert(1, "--write-auto-subs" if used_type == "auto" else "--write-subs")
+        # Note: insert(1, ...) keeps it right after yt-dlp; extractor args remain present in list
 
         try:
             subprocess.run(base_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
