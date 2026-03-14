@@ -14,7 +14,7 @@ RUN curl -fsSL https://deno.land/install.sh | sh \
 WORKDIR /app
 COPY main.py /app/main.py
 
-RUN pip install --no-cache-dir fastapi uvicorn yt-dlp
+RUN pip install --no-cache-dir fastapi uvicorn --pre "yt-dlp[default]"
 
 EXPOSE 8000
 CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
